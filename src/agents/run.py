@@ -5,7 +5,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from openai.types.responses import ResponseCompletedEvent
+from openai.types.responses import ResponseCompletedEvent, ResponseFunctionToolCall
 
 from ._run_impl import (
     AgentToolUseTracker,
@@ -747,6 +747,12 @@ class Runner:
             run_config,
             tool_use_tracker,
         )
+
+        # Logs handoffs, tool calls, and responses.
+        if type(new_response.output[0]) is ResponseFunctionToolCall:
+            print("Handoff/Tool call:", new_response.output[0].name)
+        else:
+            print("Response:", new_response.output[0].content[0].text)
 
         return await cls._get_single_step_result_from_response(
             agent=agent,
