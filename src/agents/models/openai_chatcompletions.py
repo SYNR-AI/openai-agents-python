@@ -108,6 +108,7 @@ class OpenAIChatCompletionsModel(Model):
         output_schema: AgentOutputSchema | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        previous_response_id: str | None,
     ) -> ModelResponse:
         with generation_span(
             model=str(self.model),
@@ -156,7 +157,7 @@ class OpenAIChatCompletionsModel(Model):
             return ModelResponse(
                 output=items,
                 usage=usage,
-                referenceable_id=None,
+                response_id=None,
             )
 
     async def stream_response(
@@ -168,6 +169,8 @@ class OpenAIChatCompletionsModel(Model):
         output_schema: AgentOutputSchema | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         """
         Yields a partial message as it is generated, as well as the usage information.
@@ -497,7 +500,11 @@ class OpenAIChatCompletionsModel(Model):
             span.span_data.input = converted_messages
 
         parallel_tool_calls = (
-            True if model_settings.parallel_tool_calls and tools and len(tools) > 0 else NOT_GIVEN
+            True
+            if model_settings.parallel_tool_calls and tools and len(tools) > 0
+            else False
+            if model_settings.parallel_tool_calls is False
+            else NOT_GIVEN
         )
         tool_choice = _Converter.convert_tool_choice(model_settings.tool_choice)
         response_format = _Converter.convert_response_format(output_schema)
@@ -518,8 +525,10 @@ class OpenAIChatCompletionsModel(Model):
                 f"Response format: {response_format}\n"
             )
 
-        # Match the behavior of Responses where store is True when not given
-        store = model_settings.store if model_settings.store is not None else True
+        reasoning_effort = model_settings.reasoning.effort if model_settings.reasoning else None
+        store = _Converter.get_store_param(self._get_client(), model_settings)
+
+        stream_options = _Converter.get_stream_options_param(self._get_client(), model_settings)
 
         ret = await self._get_client().chat.completions.create(
             model=self.model,
@@ -534,9 +543,13 @@ class OpenAIChatCompletionsModel(Model):
             response_format=response_format,
             parallel_tool_calls=parallel_tool_calls,
             stream=stream,
-            stream_options={"include_usage": True} if stream else NOT_GIVEN,
-            store=store,
+            stream_options=self._non_null_or_not_given(stream_options),
+            store=self._non_null_or_not_given(store),
+            reasoning_effort=self._non_null_or_not_given(reasoning_effort),
             extra_headers=_HEADERS,
+            extra_query=model_settings.extra_query,
+            extra_body=model_settings.extra_body,
+            metadata=self._non_null_or_not_given(model_settings.metadata),
         )
 
         if isinstance(ret, ChatCompletion):
@@ -555,6 +568,7 @@ class OpenAIChatCompletionsModel(Model):
             temperature=model_settings.temperature,
             tools=[],
             parallel_tool_calls=parallel_tool_calls or False,
+            reasoning=model_settings.reasoning,
         )
         return response, ret
 
@@ -565,6 +579,29 @@ class OpenAIChatCompletionsModel(Model):
 
 
 class _Converter:
+    @classmethod
+    def is_openai(cls, client: AsyncOpenAI):
+        return str(client.base_url).startswith("https://api.openai.com")
+
+    @classmethod
+    def get_store_param(cls, client: AsyncOpenAI, model_settings: ModelSettings) -> bool | None:
+        # Match the behavior of Responses where store is True when not given
+        default_store = True if cls.is_openai(client) else None
+        return model_settings.store if model_settings.store is not None else default_store
+
+    @classmethod
+    def get_stream_options_param(
+        cls, client: AsyncOpenAI, model_settings: ModelSettings
+    ) -> dict[str, bool] | None:
+        default_include_usage = True if cls.is_openai(client) else None
+        include_usage = (
+            model_settings.include_usage
+            if model_settings.include_usage is not None
+            else default_include_usage
+        )
+        stream_options = {"include_usage": include_usage} if include_usage is not None else None
+        return stream_options
+
     @classmethod
     def convert_tool_choice(
         cls, tool_choice: Literal["auto", "required", "none"] | str | None
